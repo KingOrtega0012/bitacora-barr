@@ -339,14 +339,260 @@ recién vaciada; propagación real de borrado lógico entre dos dispositivos
 (tombstone confirmado en Supabase y el producto borrado nunca revive en
 el segundo dispositivo).
 
+**Desconexión de red real y PWA instalada — verificado en dispositivo real:**
+probado en una tablet real (Android, Chrome) instalada como PWA desde el
+icono de la pantalla de inicio, con el Wi-Fi físicamente desactivado (modo
+avión, no un flag interno de la app): con la app ya abierta y sin red, se
+crearon un producto nuevo, un movimiento de entrada y uno de salida, y una
+incidencia de temperatura; todo se guardó con normalidad y quedó pendiente
+de sincronizar. Al reactivar el Wi-Fi, todo llegó a Supabase sin pérdidas
+ni duplicados (contrastado contra un recuento antes/después: productos
++1, movimientos +2, incidencias +1 — exactamente lo creado offline).
+**VERIFIED_REAL.**
+
+**Dos bugs reales más encontrados y corregidos durante estas pruebas en
+dispositivo real** (ninguno relacionado con la desconexión en sí, ambos
+rompían el guardado de cualquier registro en cuanto el dispositivo tenía
+en IndexedDB algún registro con el campo `fecha` vacío — algo que puede
+pasar por datos de prueba, una migración parcial, etc.):
+- `reloadAll()` (`js/app.js`) usaba `b.fecha.localeCompare(a.fecha)` sin
+  proteger contra `fecha` ausente; como se llama tras cada `put()`, un solo
+  registro sin fecha rompía el guardado de CUALQUIER cosa (crear un
+  producto se guardaba bien en IndexedDB, pero la pantalla se quedaba
+  colgada sin cerrar ni avisar, porque el código posterior nunca se
+  ejecutaba). Mismo patrón en el listado de "Historial" y en el listado de
+  tareas de mantenimiento (`proximaRealizacion`).
+- El panel principal y los informes (`render()`, generación de informes)
+  hacían `m.fecha.slice(0,10)` igual de desprotegido, rompiendo la
+  pantalla de inicio entera (mensaje "No se pudo iniciar la base de datos
+  local", engañoso — el fallo real no era la base de datos sino el
+  renderizado posterior).
+Corregido en los 8 puntos con `(x.fecha||'')` antes de `.localeCompare`/
+`.slice`. Verificado de nuevo en dispositivo real tras el fix: crear
+producto, ver panel principal e Historial funcionan con normalidad.
+
+**Bug real encontrado y corregido — last-write-wins NO se aplicaba en el
+servidor:** el diseño documentaba "última escritura gana por `updated_at`"
+pero eso solo estaba implementado en el *pull* del cliente (`js/sync.js`,
+`pullTable()`), nunca en el *push*. Demostrado contra Supabase real: un
+dispositivo A sube una edición reciente de un producto; después, un
+dispositivo B sincroniza (tarde) una edición que había hecho offline hace
+3 días — el `upsert` del servidor, al no comparar fechas, aceptaba sin más
+la de B y **sobrescribía la de A**, aunque fuera objetivamente más vieja.
+Cualquier tercer dispositivo o instalación nueva que sincronizara en ese
+momento se habría quedado con el dato incorrecto — pérdida silenciosa de
+datos real, no hipotética.
+
+**Corrección**: trigger `reject_stale_update()` en PostgreSQL, aplicado a
+las 16 tablas editables (todas menos `stock_movements`, que nunca se
+actualiza — solo se inserta, es un registro de eventos inmutable y ajeno
+a este mecanismo). Un `UPDATE` cuyo `updated_at` entrante sea igual o
+anterior al que ya hay en la fila se convierte en no-op (se conserva la
+fila existente) en vez de sobrescribir — sin romper los reintentos
+idempotentes (mismo id + mismo `updated_at` → no-op silencioso, no error).
+Reproducido el mismo escenario tras el fix: ahora gana correctamente la
+edición más reciente. **VERIFIED_REAL.**
+
+Qué gana y qué se puede perder, documentado explícitamente: gana siempre
+el `updated_at` más alto, sea cual sea el orden real en que los cambios
+llegan al servidor. Esto significa que una edición offline muy antigua que
+finalmente sincroniza **nunca sobrescribirá** una edición más reciente ya
+subida — pero también significa que, si dos dispositivos editan el MISMO
+registro casi al mismo tiempo, la edición "perdedora" se descarta por
+completo (no se fusiona campo a campo); quien pierda esa carrera debe
+volver a aplicar su cambio si aún lo necesita. `stock_movements` es la
+única entidad exenta de esta pérdida posible, precisamente porque nunca
+se resuelve por conflicto: todo movimiento se suma, nunca se sobrescribe.
+
+**Bug real encontrado y corregido — orden de escritura local rompía la
+FK `invoice_items_invoice_id_fkey` al sincronizar:** al confirmar una
+factura desde la UI real, el código local escribía primero todas las
+líneas de factura (`facturaLineas`/`invoice_items`, que referencian
+`facturaId`/`invoice_id`) y solo al final el registro de la propia
+factura (`facturas`/`invoices`). En local (IndexedDB, sin FK) esto no
+daba error, pero al sincronizar a Supabase, `sync_queue` procesa los
+elementos en el orden en que se encolaron: los `invoice_items` llegaban
+al servidor antes que su `invoices` padre, y PostgREST rechazaba el
+insert con `insert or update on table "invoice_items" violates foreign
+key constraint "invoice_items_invoice_id_fkey"` — la factura y sus
+líneas quedaban en `FAILED` sin sincronizar, y el inventario del
+servidor no reflejaba la entrada de mercancía aunque la app local
+mostrara "Factura confirmada" sin avisar del problema.
+
+**Corrección**: en `js/app.js`, dentro del confirm handler de
+`openFacturaRevisionSheet()`, se movió el `await put('facturas', ...)`
+para que se ejecute (y por tanto se encole) ANTES del bucle que crea
+las líneas (`facturaLineas`) y sus movimientos de stock asociados, en
+vez de después. Reproducido el escenario exacto contra Supabase real:
+factura de prueba `FASE8-TEST-001` (antes del fix) quedó con `FAILED` y
+el error de FK citado arriba. Tras el fix, una segunda factura de
+prueba (`FASE8-TEST-002`, 2 líneas — un producto existente y uno
+nuevo) se creó desde la UI real servida en el dispositivo, y se
+verificó directamente contra Supabase (autenticado como el usuario de
+negocio, no admin): la fila de `invoices` sincronizó correctamente, sus
+2 `invoice_items` sincronizaron con `invoice_id` apuntando a esa
+factura y `product_id` a los productos correctos (incluido el producto
+creado al vuelo desde la línea de factura), y los 2 `stock_movements`
+generados sincronizaron con `stockAnterior`/`stockPosterior` correctos
+(0→3 y 0→2). Cola de sincronización (`sync_queue`) vacía tras el
+proceso — 0 pendientes, 0 fallidos. **VERIFIED_REAL.**
+
+### Despliegue en producción: GitHub Pages
+
+Además del servidor local usado para las primeras pruebas, la app se
+publicó en GitHub Pages (`https://<usuario>.github.io/<repo>/`) para poder
+probarla desde la tablet en el negocio sin depender de tener el PC
+encendido y en la misma red. Es una app 100% estática (HTML/JS/CSS), así
+que no requiere build ni servidor propio — solo subir los archivos al
+repositorio y activar Pages. `config.js` es seguro de publicar: solo
+contiene la URL de Supabase y la "publishable key", pensada para ser
+pública (la seguridad real la da RLS). Cada cambio de código debe
+resubirse manualmente al repositorio para que se refleje en la URL
+pública — no hay despliegue automático configurado.
+
+**Bug real encontrado y corregido — rendimiento a 600+ productos rompía
+la sincronización de bajada (pull) de forma permanente:** al sembrar 601
+productos reales en Supabase en lotes de 100 (mismo patrón que tendría una
+futura importación masiva), se descubrió que Postgres asigna el mismo
+`now()` a todas las filas de una misma sentencia `INSERT` — así que 100
+productos quedaron con un `updated_at` idéntico. `pullTable()` en
+`js/sync.js` bajaba como máximo 500 filas por ciclo (`.limit(500)`, sin
+paginar) y usaba `updated_at > cursor` para saber qué faltaba. El corte de
+500 cayó en medio de ese grupo de 100 con timestamp idéntico: el cursor
+avanzó hasta ese timestamp exacto y, como el filtro era "estrictamente
+mayor que", las filas restantes del grupo —y todo lo posterior— dejaban de
+bajar **para siempre**. Verificado contra Supabase real: 113 de 601
+productos quedaron atascados de forma permanente, sin recuperarse ni
+esperando minutos ni recargando. **Corrección**: 1) paginar dentro de la
+misma llamada con `.range()` hasta agotar todo lo pendiente en vez de
+bajar como mucho 500 por ciclo, y 2) usar `.gte()` en vez de `.gt()`, con
+`id` como desempate de orden — reaplicar una fila ya conocida en local es
+inofensivo (sobrescribe con los mismos datos), así que ninguna fila con
+timestamp empatado en el borde se pierde. Reproducido el mismo escenario
+tras el fix: los 601 productos terminan bajando por completo. **VERIFIED_REAL.**
+
+**Bug real encontrado y corregido — 5 tablas nunca podían sincronizar
+bajada entre dispositivos:** mientras se investigaba el bug anterior,
+apareció en consola un error `400` recurrente para `equipos`,
+`proveedores`, `inventariosFisicos`, `checklists` y `tareasMantenimiento`:
+`"failed to parse select parameter (id,updated_at,deleted_at,data,)"`. La
+causa: estas 5 tablas no añaden columnas propias al `select` de Supabase
+(`extra: r => ({})`), y `Object.keys({}).join(',')` da una cadena vacía,
+dejando una coma colgando al final del `select` sin nada detrás —
+PostgREST rechaza esa sintaxis con `400`. El fallo era silencioso (solo un
+`console.warn`), así que un segundo dispositivo llevaba sin poder bajar
+NUNCA equipos, proveedores, conteos de inventario, checklists ni tareas de
+mantenimiento creados en otro dispositivo — únicamente veía los suyos
+propios. Esto explica, en parte, lo que reportaste al probar la tablet en
+el negocio. **Corrección**: construir la lista de columnas sin coma
+sobrante cuando no hay columnas extra. Reproducido contra Supabase real
+tras el fix: las 5 tablas bajan sus datos correctamente (equipos,
+proveedores, checklists y tareas de mantenimiento verificados con datos
+reales del negocio de prueba). **VERIFIED_REAL.**
+
+**Bug real encontrado y corregido — `pullAll()` sin protección contra
+ejecuciones simultáneas:** a diferencia de `processQueue()` (que ya usaba
+una bandera `syncing` para no solaparse consigo misma), `pullAll()` no
+tenía ninguna protección equivalente — el temporizador periódico y la
+llamada a `pullAll()` que hace `processQueue()` tras un push con éxito
+podían solaparse. No provocaba pérdida de datos (cada ciclo es idempotente
+y se autocorrige en el siguiente), pero sí trabajo duplicado y
+escrituras de cursor que se pisaban entre sí innecesariamente — se detectó
+al ver que, tras el fix de paginación, 13 productos tardaban un ciclo
+extra de más en llegar sin motivo aparente. **Corrección**: misma técnica
+de bandera (`pulling`) que ya usa `processQueue()`. **VERIFIED_REAL.**
+
+### "Cerrar sesión" invisible para roles no-administrador
+
+**Bug real encontrado y corregido:** al preparar la matriz de recuperación
+se descubrió que la tarjeta "Usuarios y seguridad" de la pestaña "Más" —
+que contenía el botón "Cerrar sesión" de la cuenta Supabase — solo se
+muestra para el rol ADMINISTRADOR (`PERMISOS_POR_ROL`). Con el rol
+habitual del día a día (Encargado o Empleado) no había forma de cerrar
+sesión para cambiar de cuenta/negocio, aunque esa acción no tiene nada que
+ver con los permisos de gestión del catálogo que sí tiene sentido
+restringir. **Corrección**: la cuenta Supabase y "Cerrar sesión" pasan a
+su propia tarjeta, siempre visible con Supabase configurado,
+independiente del rol local. De paso se corrigió el texto de la tarjeta
+"Sincronización", que databa de antes de Fase 6 y seguía diciendo "no hay
+sincronización en tiempo real" incluso con la sincronización real activa
+y funcionando. **VERIFIED_REAL.**
+
+### Matriz de recuperación de 7 casos
+
+Probados los 7 casos (A: creado offline: B: internet vuelve durante push;
+C: internet desaparece a media subida; D: cierre forzado de la app con
+pendientes; E: reinicio del navegador; F: reapertura offline; G: internet
+vuelve después de D-F) contra la app real publicada en GitHub Pages, con
+desconexión de Wi-Fi física y real en una tablet física — nunca una bandera
+simulada. A-C, D/E (cubiertos juntos: forzar cierre de la app cubre ambos),
+F superados sin incidencias: los datos se crean, persisten y sincronizan
+correctamente sin duplicados ni pérdidas en cada uno.
+
+**Bug real encontrado y corregido en el caso G — sincronización sin sesión
+válida devolvía error permanente engañoso:** al forzar el cierre de la app
+y reabrirla offline, el usuario puede elegir "Seguir sin conectar (solo
+local)" en vez de iniciar sesión — diseño correcto, los datos siguen
+creándose con normalidad. Pero al recuperar la conexión, la app intentaba
+subir esos datos IGUAL, sin sesión válida de Supabase. Reproducido contra
+Supabase real: un push sin sesión válida es rechazado con
+`401 — new row violates row-level security policy`, un error que el
+reintento con backoff nunca iba a resolver solo (no es un fallo de red
+temporal, hace falta volver a iniciar sesión) — el registro se quedaba
+"pendiente con error" de forma permanente y sin explicación clara.
+**Corrección**: `readyToSync()` ahora comprueba que hay una sesión activa
+antes de intentar sincronizar; si no la hay, los datos se quedan a salvo
+en la cola local sin marcarse con un error falso, hasta que alguien
+inicie sesión de nuevo. Reproducido el escenario completo tras el fix:
+al volver a iniciar sesión, el registro pendiente sincroniza
+correctamente. **VERIFIED_REAL.**
+
+### Bug real #6: el pull periódico no se ejecutaba si el dispositivo no tenía nada propio que subir
+
+Encontrado en la prueba de dos dispositivos físicos simultáneos (tablet +
+móvil, ambos como PWA instalada, ambos con la cuenta de pruebas de
+Negocio B, con los 608 productos ya sincronizados de antes). Cada
+dispositivo creó un producto de prueba (`SYNC-TAB-01` en la tablet,
+`SYNC-TEL-01` en el móvil). El móvil, al subir el suyo, terminó viendo
+ambos productos (610 en total) porque su propio push exitoso disparó un
+`pullAll()`. La tablet se quedó **permanentemente atascada en 609**
+(608 + el suyo propio) y nunca bajó el del móvil, incluso con varios
+minutos de espera, la app abierta y conexión activa.
+
+**Causa raíz**: el diseño documentado al inicio de `sync.js` dice que el
+pull se dispara "al cargar la app, al recuperar conexión, y cada
+`SYNC_INTERVAL_MS`" — pero en el código, tanto el listener `'online'`
+como el temporizador periódico solo llamaban a `processQueue()`.
+`pullAll()` únicamente se ejecutaba *dentro* de `processQueue()` cuando
+hubo algo propio que subir con éxito (`if (okCount) await pullAll();`).
+Un dispositivo sin cambios locales pendientes en su cola (como la
+tablet, tras subir su único producto de prueba) nunca vuelve a tener
+`okCount > 0`, así que `pullAll()` deja de ejecutarse para siempre en
+ese dispositivo hasta que recargue la app entera — nunca baja cambios
+hechos en OTRO dispositivo mientras permanece abierto.
+
+Reproducido de forma aislada contra Supabase real: una consulta idéntica
+a la que hace `pullTable('productos', ...)` con el cursor exacto que
+tendría la tablet tras su propio push (`updated_at >= '...14:21:48.700Z'`)
+devuelve correctamente ambas filas (`SYNC-TAB-01` y `SYNC-TEL-01`),
+confirmando que la consulta de pull en sí es correcta — el problema era
+exclusivamente que nadie la ejecutaba en el ciclo periódico sin un push
+exitoso de por medio.
+
+**Corrección**: se añade una llamada explícita a `pullAll()`, independiente
+de `processQueue()`, tanto en el listener `'online'` como en cada tick
+del temporizador periódico (`setInterval`), para que el pull ocurra
+siempre que haya conexión, tenga o no el dispositivo algo propio que
+subir. **VERIFIED_REAL** (query aislada confirmada contra Supabase real;
+pendiente reconfirmar en los dos dispositivos físicos tras desplegar
+el fix, ver abajo).
+
 **Pendiente de esta fase** (ver el informe entregado en el chat para el
 detalle completo con la taxonomía VERIFIED_REAL/BLOCKED/NOT_TESTED):
-desconexión de red real (se simuló hasta ahora con IndexedDB vacía, no con
-una desconexión física); instalación PWA en un dispositivo real y prueba
-tras reinicio; rendimiento a 300–1000+ productos; flujo completo de
-factura/merma con adjunto desde la UI real contra Storage; matriz de
-recuperación de 7 casos; documentación explícita del conflicto LWW en
-entidades editables con ejemplo real.
+reconfirmar en los dos dispositivos físicos (tablet + móvil) que, tras
+desplegar el fix del bug #6, un producto creado en un dispositivo
+aparece en el otro sin necesidad de que este último tenga algo propio
+que subir.
 
 ## Siguientes pasos recomendados
 
