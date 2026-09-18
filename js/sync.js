@@ -431,8 +431,34 @@
   }
 
   /* -------------------- ARRANQUE -------------------- */
+  /* Bug real encontrado en Fase 8 (prueba de dos dispositivos físicos
+     simultáneos): el diseño documentado arriba dice que el pull se
+     dispara "al cargar la app, al recuperar conexión, y cada
+     SYNC_INTERVAL_MS" — pero en el código, tanto el listener 'online'
+     como el temporizador periódico solo llamaban a processQueue(), y
+     pullAll() únicamente se ejecutaba DENTRO de processQueue() si hubo
+     algo propio que subir con éxito (`if (okCount) await pullAll();`).
+     Un dispositivo sin cambios locales pendientes (p. ej. la tablet,
+     tras subir su propio producto de prueba) nunca vuelve a tener
+     okCount>0, así que pullAll() deja de ejecutarse para siempre en ese
+     dispositivo hasta que recargue la app — nunca baja cambios hechos
+     en OTRO dispositivo.
+     Reproducido con datos reales: tablet y teléfono con la cuenta de
+     pruebas B, cada uno crea un producto nuevo (SYNC-TAB-01 en la
+     tablet, SYNC-TEL-01 en el teléfono). El teléfono sí ve ambos
+     (porque su propio push disparó un pullAll() que trajo el de la
+     tablet), pero la tablet se queda atascada en 609 productos (608 +
+     el suyo) y nunca baja el del teléfono (610), incluso esperando
+     varios minutos con la app abierta y con conexión activa.
+     Corrección: llamar a pullAll() de forma independiente en el
+     listener 'online' y en cada tick del temporizador, no solo como
+     efecto secundario de un push exitoso. */
   async function start(){
-    window.addEventListener('online', () => { setStatus('Reconectado — sincronizando…','busy'); processQueue(); });
+    window.addEventListener('online', () => {
+      setStatus('Reconectado — sincronizando…','busy');
+      processQueue();
+      pullAll();
+    });
     window.addEventListener('offline', () => setStatus('Sin conexión — trabajando en local', 'offline'));
 
     if (!window.SB || !window.SB.isConfigured) {
@@ -447,7 +473,11 @@
     processQueue();
     const interval = (window.APP_CONFIG && window.APP_CONFIG.SYNC_INTERVAL_MS) || 60000;
     intervalHandle = setInterval(async () => {
-      if (await readyToSync()) { processQueue(); getBusinessId().then(id => id && registerDevice(id)); }
+      if (await readyToSync()) {
+        processQueue();
+        pullAll();
+        getBusinessId().then(id => id && registerDevice(id));
+      }
     }, interval);
   }
 
