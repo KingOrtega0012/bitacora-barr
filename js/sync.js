@@ -228,12 +228,26 @@
   }
 
   /* -------------------- PULL -------------------- */
+  /* Bug real encontrado en Fase 8: a diferencia de processQueue() (que usa
+     la bandera `syncing` para no solaparse consigo misma), pullAll() no
+     tenía ninguna protección contra ejecuciones simultáneas — el temporizador
+     periódico y la llamada a pullAll() que hace processQueue() tras un push
+     con éxito podían solaparse. No perdía datos (cada ciclo es idempotente
+     y se autocorrige en el siguiente), pero sí generaba trabajo duplicado y
+     escrituras de cursor que se pisaban entre sí innecesariamente. Se cierra
+     con la misma técnica de bandera que ya usa processQueue(). */
+  let pulling = false;
   async function pullAll(){
-    if (!readyToSync()) return;
-    const businessId = await getBusinessId();
-    if (!businessId) return;
-    for (const store of Object.keys(TABLE_MAP)) {
-      await pullTable(store, businessId).catch(err => console.warn('[sync] fallo al bajar', store, err.message||err));
+    if (pulling || !readyToSync()) return;
+    pulling = true;
+    try {
+      const businessId = await getBusinessId();
+      if (!businessId) return;
+      for (const store of Object.keys(TABLE_MAP)) {
+        await pullTable(store, businessId).catch(err => console.warn('[sync] fallo al bajar', store, err.message||err));
+      }
+    } finally {
+      pulling = false;
     }
   }
   async function pullTable(store, businessId){
@@ -242,7 +256,22 @@
     const cursorRow = await getOne('config', cursorKey);
     const since = cursorRow ? cursorRow.value : '1970-01-01T00:00:00.000Z';
     const isAdjuntos = store === 'adjuntos';
-    const extraCols = isAdjuntos ? 'storage_path,content_type' : Object.keys(map.extra({})).join(',');
+    /* Bug real encontrado en Fase 8 (visible en consola al probar con datos
+       reales de equipos/neveras): para las tablas cuyo `extra()` no añade
+       ninguna columna propia (equipos, proveedores, inventariosFisicos,
+       checklists, tareasMantenimiento), `Object.keys({}).join(',')` da una
+       cadena VACÍA, y el select quedaba como
+       'id,updated_at,deleted_at,data,' — con una coma colgando al final sin
+       nada detrás. PostgREST rechaza eso con 400 "failed to parse select
+       parameter", así que el PULL de esas 5 tablas fallaba silenciosamente
+       en cada ciclo (solo un console.warn) desde que se añadieron: un
+       segundo dispositivo nunca podía bajar equipos, proveedores, conteos
+       de inventario, checklists ni tareas de mantenimiento creados en otro
+       dispositivo. Reproducido en consola real contra el proyecto de
+       Supabase real. Corrección: construir la lista de columnas sin coma
+       sobrante cuando no hay columnas extra. */
+    const extraKeys = isAdjuntos ? ['storage_path','content_type'] : Object.keys(map.extra({}));
+    const selectCols = ['id','updated_at','deleted_at','data', ...extraKeys].join(',');
 
     /* Bug real encontrado en Fase 8 (prueba de rendimiento con 600+ productos
        insertados en el mismo lote): varias filas insertadas en una misma
@@ -268,7 +297,7 @@
     while (true) {
       const { data: page, error } = await SB.client
         .from(map.table)
-        .select('id,updated_at,deleted_at,data,' + extraCols)
+        .select(selectCols)
         .eq('business_id', businessId)
         .gte('updated_at', since)
         .order('updated_at', { ascending: true })
