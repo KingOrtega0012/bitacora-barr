@@ -79,8 +79,25 @@
     }catch(e){ return null; }
   }
 
-  function readyToSync(){
-    return !!(window.SB && window.SB.isConfigured && navigator.onLine);
+  /* Bug real encontrado en Fase 8 (matriz de recuperación, caso D→G): si se
+     pierde la sesión de Supabase — p.ej. se fuerza el cierre de la app y,
+     al reabrir sin conexión, se elige "Seguir sin conectar (solo local)" —
+     la app seguía creando datos localmente sin problema (correcto), pero
+     al recuperar la conexión intentaba subirlos IGUAL, sin sesión válida.
+     Supabase los rechazaba con RLS: 401 "new row violates row-level
+     security policy". No es un fallo de red temporal que el reintento con
+     backoff vaya a resolver solo — hace falta volver a iniciar sesión — así
+     que el registro se quedaba en un "pendiente con error" permanente y
+     confuso (el mensaje no decía que hacía falta reconectar la cuenta).
+     Reproducido contra Supabase real: un push sin sesión válida devuelve
+     exactamente ese error 401/42501. Corrección: comprobar que hay una
+     sesión activa antes de intentar sincronizar — si no la hay, la app se
+     queda en modo local (los datos siguen a salvo y se quedan en la cola
+     tal cual, sin marcarlos con un error falso) hasta que alguien vuelva a
+     iniciar sesión explícitamente. */
+  async function readyToSync(){
+    if (!(window.SB && window.SB.isConfigured && navigator.onLine)) return false;
+    try { return !!(await SB.getSession()); } catch(e) { return false; }
   }
 
   /* -------------------- ENCOLAR -------------------- */
@@ -108,7 +125,7 @@
       creado: nowISO(),
     };
     await rawPut('sync_queue', entry);
-    if (readyToSync()) processQueue(); // intento inmediato, no bloqueante
+    if (await readyToSync()) processQueue(); // intento inmediato, no bloqueante
     return entry;
   }
 
@@ -124,7 +141,7 @@
      SUMAN al llegar a Supabase, nunca se pisan entre sí (no hay ningún
      UPDATE de cantidad en esta tabla, solo upsert por id propio). */
   async function processQueue(){
-    if (syncing || !readyToSync()) return;
+    if (syncing || !(await readyToSync())) return;
     syncing = true;
     setStatus('Sincronizando…', 'busy');
     try{
@@ -238,7 +255,7 @@
      con la misma técnica de bandera que ya usa processQueue(). */
   let pulling = false;
   async function pullAll(){
-    if (pulling || !readyToSync()) return;
+    if (pulling || !(await readyToSync())) return;
     pulling = true;
     try {
       const businessId = await getBusinessId();
@@ -429,8 +446,8 @@
     await pullAll();
     processQueue();
     const interval = (window.APP_CONFIG && window.APP_CONFIG.SYNC_INTERVAL_MS) || 60000;
-    intervalHandle = setInterval(() => {
-      if (readyToSync()) { processQueue(); getBusinessId().then(id => id && registerDevice(id)); }
+    intervalHandle = setInterval(async () => {
+      if (await readyToSync()) { processQueue(); getBusinessId().then(id => id && registerDevice(id)); }
     }, interval);
   }
 
