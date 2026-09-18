@@ -244,15 +244,43 @@
     const isAdjuntos = store === 'adjuntos';
     const extraCols = isAdjuntos ? 'storage_path,content_type' : Object.keys(map.extra({})).join(',');
 
-    const { data, error } = await SB.client
-      .from(map.table)
-      .select('id,updated_at,deleted_at,data,' + extraCols)
-      .eq('business_id', businessId)
-      .gt('updated_at', since)
-      .order('updated_at', { ascending: true })
-      .limit(500);
-    if (error) throw error;
-    if (!data || !data.length) return;
+    /* Bug real encontrado en Fase 8 (prueba de rendimiento con 600+ productos
+       insertados en el mismo lote): varias filas insertadas en una misma
+       sentencia SQL comparten idéntico `updated_at` (now() es constante
+       dentro de una transacción en Postgres — puede pasar con cualquier alta
+       masiva real, no solo con datos de prueba). Con `.gt('updated_at',
+       since)` + `.limit(500)` SIN paginar, si el corte de 500 caía en medio
+       de un grupo de filas con timestamp idéntico, el cursor avanzaba hasta
+       ese timestamp exacto y las filas restantes de ese grupo —y todo lo que
+       llegara después— dejaban de bajar PARA SIEMPRE (el filtro "> since"
+       nunca vuelve a ser cierto para ese timestamp). Demostrado contra
+       Supabase real: de 601 productos, 113 quedaron permanentemente
+       atascados y el cursor no avanzaba más.
+       Corrección: 1) paginar dentro de la misma llamada con `.range()` hasta
+       agotar todo lo pendiente, en vez de bajar como mucho 500 por ciclo, y
+       2) usar `.gte()` en vez de `.gt()`, con `id` como desempate de orden —
+       reaplicar una fila con el mismo timestamp que ya se tiene en local es
+       inofensivo (putFromRemote sobrescribe con los mismos datos), así que
+       ninguna fila con timestamp empatado en el borde se pierde. */
+    let data = [];
+    let offset = 0;
+    const PAGE = 500;
+    while (true) {
+      const { data: page, error } = await SB.client
+        .from(map.table)
+        .select('id,updated_at,deleted_at,data,' + extraCols)
+        .eq('business_id', businessId)
+        .gte('updated_at', since)
+        .order('updated_at', { ascending: true })
+        .order('id', { ascending: true })
+        .range(offset, offset + PAGE - 1);
+      if (error) throw error;
+      if (!page || !page.length) break;
+      data = data.concat(page);
+      if (page.length < PAGE) break;
+      offset += PAGE;
+    }
+    if (!data.length) return;
 
     let maxSeen = since;
     for (const row of data) {
