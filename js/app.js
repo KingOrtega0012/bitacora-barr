@@ -200,12 +200,21 @@ async function reloadAll(){
     getAll('productos'), getAll('movimientos'), getAll('equipos'), getAll('temperaturas'), getAll('proveedores'), getAll('facturas'), getAll('inventariosFisicos'),
     getAll('checklists'), getAll('checklistRegistros'), getAll('tareasMantenimiento'), getAll('incidencias'), getAll('usuarios')
   ]);
-  STATE.movimientos.sort((a,b)=> b.fecha.localeCompare(a.fecha));
-  STATE.temperaturas.sort((a,b)=> b.fecha.localeCompare(a.fecha));
-  STATE.facturas.sort((a,b)=> b.fecha.localeCompare(a.fecha));
-  STATE.inventariosFisicos.sort((a,b)=> b.fecha.localeCompare(a.fecha));
-  STATE.checklistRegistros.sort((a,b)=> b.fecha.localeCompare(a.fecha));
-  STATE.incidencias.sort((a,b)=> b.fecha.localeCompare(a.fecha));
+  // Bug real encontrado en Fase 8: un solo registro con `fecha` vacía/ausente
+  // (por ejemplo, sincronizado desde otro dispositivo o creado por una vía
+  // que no pasa por el formulario normal) hacía que reloadAll() entero
+  // lanzara una excepción sin capturar en el .sort() — y como reloadAll()
+  // se llama justo después de put() en cada guardado, cualquier pantalla
+  // (crear producto, registrar movimiento, etc.) se quedaba "colgada" sin
+  // cerrar ni avisar, aunque el dato SÍ se hubiera guardado bien en
+  // IndexedDB. Se compara con '' como valor de reserva (nunca se pierde ni
+  // se reordena el resto del listado por un único registro incompleto).
+  STATE.movimientos.sort((a,b)=> (b.fecha||'').localeCompare(a.fecha||''));
+  STATE.temperaturas.sort((a,b)=> (b.fecha||'').localeCompare(a.fecha||''));
+  STATE.facturas.sort((a,b)=> (b.fecha||'').localeCompare(a.fecha||''));
+  STATE.inventariosFisicos.sort((a,b)=> (b.fecha||'').localeCompare(a.fecha||''));
+  STATE.checklistRegistros.sort((a,b)=> (b.fecha||'').localeCompare(a.fecha||''));
+  STATE.incidencias.sort((a,b)=> (b.fecha||'').localeCompare(a.fecha||''));
 }
 function provById(id){ return STATE.proveedores.find(x=>x.id===id); }
 function refreshProvDatalist(){
@@ -557,7 +566,7 @@ function renderDashboard(root){
       </div>
       <div class="stat info">
         <div class="top"><span class="label">Movimientos</span><span class="pill-icon" style="background:var(--surface)">↕️</span></div>
-        <span class="value c-info">${STATE.movimientos.filter(m=>m.fecha.slice(0,10)===new Date().toISOString().slice(0,10)).length}</span>
+        <span class="value c-info">${STATE.movimientos.filter(m=>(m.fecha||'').slice(0,10)===new Date().toISOString().slice(0,10)).length}</span>
         <span class="tiny">hoy</span>
       </div>
     </div>
@@ -1016,6 +1025,18 @@ function openFacturaRevisionSheet(factura){
       sheetEl.querySelector('#confirmFacturaBtn').addEventListener('click', async ()=>{
         const facturaId = uid();
         const proveedor = await ensureProveedor(factura.proveedor);
+        /* Bug real encontrado en Fase 8: la factura se guardaba (put) DESPUÉS
+           de sus líneas (facturaLineas → invoice_items). Localmente no pasa
+           nada (IndexedDB no tiene FK), pero al sincronizar, la cola procesa
+           en el orden en que se encoló cada cambio — así que las líneas
+           intentaban subirse a Supabase antes de que la factura existiera
+           ahí, y el servidor las rechazaba por la clave foránea
+           invoice_items_invoice_id_fkey. Se autorrecuperaba en el siguiente
+           reintento (cuando la factura ya hubiera subido), pero es un fallo
+           real e innecesario. Se guarda la factura primero para que quede
+           encolada (y por tanto sincronizada) antes que sus líneas. */
+        await put('facturas', {id:facturaId, proveedorId:proveedor?proveedor.id:null, proveedor:factura.proveedor, fecha:factura.fecha, numFactura:factura.numFactura,
+          imgDataUrl:factura.imgDataUrl, lineas:factura.lineas, total:factura.lineas.reduce((s,l)=>s+l.cantidad*l.precio,0), creadaEn:nowISO()});
         for(const l of factura.lineas){
           let productoId = l.productoId;
           if(!productoId){
@@ -1036,8 +1057,6 @@ function openFacturaRevisionSheet(factura){
           await put('facturaLineas', {id:uid(), facturaId, productoId, nombre:l.nombre, cantidad:l.cantidad, precio:l.precio,
             movimientoId:mov.id, esNuevoProducto: !l.productoId});
         }
-        await put('facturas', {id:facturaId, proveedorId:proveedor?proveedor.id:null, proveedor:factura.proveedor, fecha:factura.fecha, numFactura:factura.numFactura,
-          imgDataUrl:factura.imgDataUrl, lineas:factura.lineas, total:factura.lineas.reduce((s,l)=>s+l.cantidad*l.precio,0), creadaEn:nowISO()});
         if(factura.imgDataUrl) await registrarAdjunto({entidadTipo:'invoices', entidadId:facturaId, dataUrl:factura.imgDataUrl});
         await reloadAll();
         closeSheet(); toast('Factura confirmada: inventario actualizado'); goTab('dashboard');
@@ -1469,7 +1488,7 @@ function renderHistorial(root){
     if(histFilter==='todos' || histFilter==='temp'){
       STATE.temperaturas.forEach(t=>entries.push({kind:'temp',data:t,fecha:t.fecha}));
     }
-    entries.sort((a,b)=>b.fecha.localeCompare(a.fecha));
+    entries.sort((a,b)=>(b.fecha||'').localeCompare(a.fecha||''));
     entries = entries.slice(0,80);
     const card = root.querySelector('#histCard');
     card.innerHTML = entries.length ? entries.map(e=>{
@@ -1528,6 +1547,21 @@ function renderMas(root){
       </div>
       ${can('seguridad')? securityCardHtml() : ''}
     </div>` : ''}
+    ${window.SB && window.SB.isConfigured ? `
+    <!-- Bug real encontrado en Fase 8: la cuenta de Supabase (y "Cerrar
+         sesión") vivía SOLO dentro de la tarjeta "Usuarios y seguridad",
+         que se oculta por completo salvo para el rol ADMINISTRADOR (ver
+         PERMISOS_POR_ROL). Un usuario con rol Encargado o Empleado —
+         perfiles habituales del día a día — nunca podía ver esa tarjeta,
+         así que no había forma de cerrar sesión de la cuenta Supabase (por
+         ejemplo, para cambiar entre dos negocios) sin ser Administrador.
+         Cerrar sesión es una acción de dispositivo/sesión, no un permiso
+         de gestión del catálogo, así que se separa en su propia tarjeta
+         siempre visible, sin depender del rol local. */ -->
+    <div class="card">
+      <div class="section-head"><h2>Cuenta Supabase</h2></div>
+      ${supabaseAccountHtml()}
+    </div>` : ''}
     <div class="card">
       <div class="section-head"><h2>Copia de seguridad</h2></div>
       <div class="muted" style="margin-top:4px">Exporta todos los datos como JSON para guardarlos fuera de este dispositivo, o restaura una copia anterior.</div>
@@ -1550,8 +1584,17 @@ function renderMas(root){
       <div class="tiny" style="margin-top:10px">Todo se guarda en la memoria local de este dispositivo (IndexedDB) y persiste al cerrar la app o reiniciar el teléfono. No requiere conexión a Internet.</div>
     </div>
     <div class="card">
-      <div class="section-head"><h2>Sincronización (preparado, no activo)</h2></div>
-      <div class="muted" style="margin-top:4px">Cada dato tiene un identificador único y fecha, listo para una futura sincronización con un servidor. Ahora mismo no hay sincronización en tiempo real entre dispositivos: usa "Exportar copia" / "Importar copia" para trasladar los datos a otro teléfono.</div>
+      <!-- Bug real encontrado en Fase 8: este texto databa de antes de que
+           la sincronización real con Supabase existiera (Fase 6+) y se
+           quedó diciendo "no activo" / "no hay sincronización en tiempo
+           real" incluso con Supabase configurado y funcionando — texto
+           falso en producción que puede confundir a quien lo lea. Ahora
+           el título y el texto reflejan si hay sincronización real activa
+           o no, sin tocar nada del comportamiento real de sincronización. -->
+      <div class="section-head"><h2>Sincronización${window.SB && window.SB.isConfigured ? '' : ' (preparado, no activo)'}</h2></div>
+      <div class="muted" style="margin-top:4px">${window.SB && window.SB.isConfigured
+        ? 'Sincronización en tiempo real activa con Supabase: los cambios se suben y bajan automáticamente entre dispositivos en cuanto hay conexión. Cada dato tiene un identificador único y fecha para resolver conflictos.'
+        : 'Cada dato tiene un identificador único y fecha, listo para una futura sincronización con un servidor. Ahora mismo no hay sincronización en tiempo real entre dispositivos: usa "Exportar copia" / "Importar copia" para trasladar los datos a otro teléfono.'}</div>
       <div class="card-flat" style="margin-top:8px"><div class="tiny">ID DE ESTE DISPOSITIVO</div><div class="num" style="font-size:12px;word-break:break-all">${esc(STATE.deviceId||'—')}</div></div>
     </div>
     <div class="card">
@@ -1576,6 +1619,7 @@ function renderMas(root){
   const goProveedoresBtn = root.querySelector('#goProveedores'); if(goProveedoresBtn) goProveedoresBtn.addEventListener('click', openProveedoresListSheet);
   const goUsuariosBtn = root.querySelector('#goUsuarios'); if(goUsuariosBtn) goUsuariosBtn.addEventListener('click', openUsuariosListSheet);
   wireSecurityCard(root);
+  wireAccountCard(root);
 }
 function securityCardHtml(){
   return `
@@ -1586,16 +1630,19 @@ function securityCardHtml(){
       <div class="body"><div class="name" style="font-weight:600">Pedir PIN al abrir la app</div><div class="sub" id="sec_pinStatus">Comprobando…</div></div>
     </label>
     <div id="sec_pinSetZone" style="display:none;margin-top:8px" class="field"><label>Nuevo PIN (4 dígitos)</label><div class="fab-row"><input id="sec_pinValue" inputmode="numeric" maxlength="4" style="flex:1"><button type="button" class="btn btn-outline" id="sec_pinSave">Guardar</button></div></div>
-    ${window.SB && window.SB.isConfigured ? `
-    <div class="divider" style="margin:12px 0"></div>
-    <div class="tiny" style="margin-bottom:6px">CUENTA SUPABASE</div>
-    <div id="sec_authInfo" class="muted">Comprobando sesión…</div>
-    <button class="btn btn-outline btn-block" style="margin-top:8px" id="sec_signOut">Cerrar sesión</button>
-    ` : `
+    ${!(window.SB && window.SB.isConfigured) ? `
     <div class="divider" style="margin:12px 0"></div>
     <div class="tiny">SINCRONIZACIÓN</div>
     <div class="muted" style="margin-top:2px">Supabase no está configurado (config.js vacío) — la app funciona 100% local.</div>
-    `}
+    ` : ''}
+  `;
+}
+/* Cuenta Supabase + "Cerrar sesión" — separada de securityCardHtml() para
+   que sea visible con cualquier rol local (ver comentario en renderMas()). */
+function supabaseAccountHtml(){
+  return `
+    <div id="sec_authInfo" class="muted">Comprobando sesión…</div>
+    <button class="btn btn-outline btn-block" style="margin-top:8px" id="sec_signOut">Cerrar sesión</button>
   `;
 }
 function wireSecurityCard(root){
@@ -1616,6 +1663,8 @@ function wireSecurityCard(root){
     await setConfig('appPin', await hashPin(v)); statusEl.textContent='Activado — se pedirá PIN al abrir la app'; setZone.style.display='none';
     toast('PIN de la app guardado');
   });
+}
+function wireAccountCard(root){
   const authInfo = root.querySelector('#sec_authInfo');
   if(authInfo && window.SB && window.SB.isConfigured){
     getConfig('authProfile').then(profile=>{
@@ -2122,7 +2171,7 @@ function openMantenimientoListSheet(){
   let filtro = 'todas';
   function bodyHtml(){
     const hoyStr = new Date().toISOString().slice(0,10);
-    let items = [...STATE.tareasMantenimiento].sort((a,b)=> a.proximaRealizacion.localeCompare(b.proximaRealizacion));
+    let items = [...STATE.tareasMantenimiento].sort((a,b)=> (a.proximaRealizacion||'').localeCompare(b.proximaRealizacion||''));
     if(filtro!=='todas') items = items.filter(t=>{
       const est = tareaEstado(t).txt;
       return (filtro==='atrasada'&&est==='ATRASADA') || (filtro==='hoy'&&est==='PARA HOY') || (filtro==='pendiente'&&est==='PENDIENTE') || (filtro==='completada'&&est.includes('COMPLETADA'));
@@ -2346,7 +2395,7 @@ function openReporteSemanalSheet(){
     const r = buildReport(ini, fin);
     const porDia = {};
     for(let i=0;i<7;i++){ const d=new Date(ini); d.setDate(d.getDate()+i); const key=d.toISOString().slice(0,10); porDia[key]={entradas:0,salidas:0,mermas:0}; }
-    r.movs.forEach(m=>{ const key=m.fecha.slice(0,10); if(porDia[key]){ if(m.tipo==='entrada')porDia[key].entradas+=m.cantidad; if(m.tipo==='salida')porDia[key].salidas+=m.cantidad; if(m.tipo==='merma')porDia[key].mermas+=m.cantidad; } });
+    r.movs.forEach(m=>{ const key=(m.fecha||'').slice(0,10); if(porDia[key]){ if(m.tipo==='entrada')porDia[key].entradas+=m.cantidad; if(m.tipo==='salida')porDia[key].salidas+=m.cantidad; if(m.tipo==='merma')porDia[key].mermas+=m.cantidad; } });
     const maxDia = Math.max(1, ...Object.values(porDia).flatMap(v=>[v.entradas,v.salidas,v.mermas]));
     return `
       <div class="grid2">
@@ -2533,7 +2582,7 @@ function openAnaliticaSheet(){
   // movimientos últimos 14 días
   const dias14 = [...Array(14)].map((_,i)=>{ const d=new Date(hoy); d.setDate(d.getDate()-(13-i)); return d.toISOString().slice(0,10); });
   const porDia = Object.fromEntries(dias14.map(d=>[d,{entradas:0,salidas:0,mermas:0}]));
-  STATE.movimientos.forEach(m=>{ const k=m.fecha.slice(0,10); if(porDia[k]){ if(m.tipo==='entrada')porDia[k].entradas+=m.cantidad; if(m.tipo==='salida')porDia[k].salidas+=m.cantidad; if(m.tipo==='merma')porDia[k].mermas+=m.cantidad; } });
+  STATE.movimientos.forEach(m=>{ const k=(m.fecha||'').slice(0,10); if(porDia[k]){ if(m.tipo==='entrada')porDia[k].entradas+=m.cantidad; if(m.tipo==='salida')porDia[k].salidas+=m.cantidad; if(m.tipo==='merma')porDia[k].mermas+=m.cantidad; } });
   const maxMov = Math.max(1, ...Object.values(porDia).flatMap(v=>[v.entradas,v.salidas,v.mermas]));
   // mermas por semana (últimas 6)
   const semanas = [...Array(6)].map((_,i)=>{ const ini=startOfWeek(hoy); ini.setDate(ini.getDate()-7*(5-i)); const fin=new Date(ini); fin.setDate(fin.getDate()+6); return {ini,fin}; });
